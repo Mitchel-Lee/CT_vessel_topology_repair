@@ -12,3 +12,4 @@ Save cropped volumes (with default dimensions 80 x 80 x 80) of the broken segmen
 
 Example usage is contained within the script.
 
+![synthetic_seg_diagram](https://github.com/user-attachments/assets/fddd62bc-3d1e-495d-a962-95ef3c576552)
