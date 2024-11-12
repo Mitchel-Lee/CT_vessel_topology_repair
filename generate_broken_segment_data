@@ -305,39 +305,6 @@ def extract_subvolumes_with_ct(
     print(f"Saved breakpoints information to {os.path.join(output_dir, 'breakpoints.json')}")
 
 
-def analyze_skeleton_distances(skeleton_points):
-    """
-    Analyze and print basic information about pairwise distances between skeleton points.
-
-    Args:
-        skeleton_points (ndarray): Array of skeleton points (N x 3).
-
-    Returns:
-        None
-    """
-    print("\nAnalyzing pairwise distances between skeleton points...")
-    # Sample a subset if too many points
-    max_pairs = 10000
-    num_points = len(skeleton_points)
-    if num_points < 2:
-        print("Not enough skeleton points to analyze distances.")
-        return
-    total_pairs = num_points * (num_points - 1) // 2
-    print(f"Total possible pairs: {total_pairs}")
-    if total_pairs > max_pairs:
-        # Randomly sample pairs
-        rng = np.random.default_rng()
-        indices = rng.choice(num_points, size=(max_pairs, 2), replace=True)
-        distances = np.linalg.norm(skeleton_points[indices[:,0]] - skeleton_points[indices[:,1]], axis=1)
-    else:
-        # Compute all pairwise distances
-        distances = np.linalg.norm(skeleton_points[:, np.newaxis, :] - skeleton_points[np.newaxis, :, :], axis=2)
-        distances = distances[np.triu_indices(num_points, k=1)]
-
-    # Print basic statistics
-    print(f"Distance Statistics:\n - Min: {distances.min():.2f} voxels\n - Max: {distances.max():.2f} voxels\n - Mean: {distances.mean():.2f} voxels\n - Median: {np.median(distances):.2f} voxels")
-
-
 # Example Usage
 if __name__ == "__main__":
     data_path = "Connectivity_CT/1/"
@@ -350,9 +317,6 @@ if __name__ == "__main__":
 
     skeleton_points = np.array(list(radii.keys()))
     print(f"Number of skeleton points: {len(skeleton_points)}")
-
-    # Optional: Analyze the distribution of distances between skeleton points
-    analyze_skeleton_distances(skeleton_points)
 
     # Set maximum skeleton radius to target small vessels (adjust as needed)
     max_skeleton_radius = 5  # voxels (example value)
@@ -385,6 +349,9 @@ if __name__ == "__main__":
     if break_points:
         ct_file = os.path.join(data_path, "img.nii.gz")
         ct_nii = nib.load(ct_file)
+
+        output_dir = os.path.join(data_path, "SYNTHETIC_BREAKS")
+        extract_subvolumes_with_ct(largest_component_nii, broken_segmentation, ct_nii, break_points, output_dir=output_dir)
 
         output_dir = os.path.join(data_path, "SYNTHETIC_BREAKS")
         extract_subvolumes_with_ct(largest_component_nii, broken_segmentation, ct_nii, break_points, output_dir=output_dir)
