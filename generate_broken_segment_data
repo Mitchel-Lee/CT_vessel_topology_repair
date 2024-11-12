@@ -1,0 +1,390 @@
+# Script to generate disconnected vascular segments from intact component of "broken" vascular network
+
+# Imports
+import numpy as np
+import os
+import nibabel as nib
+from scipy.ndimage import label, distance_transform_edt
+from skimage.morphology import skeletonize_3d
+import json
+from scipy.spatial import KDTree
+
+# Note: Removed matplotlib.pyplot import since plotting is no longer needed
+
+# Function Definitions
+
+def load_and_extract_largest_component(input_file, output_path):
+    """
+    Load a segmentation NIfTI file, extract the largest connected component,
+    and save it as a new NIfTI file with a suffix indicating the largest component.
+
+    Parameters:
+        input_file (str): Path to the input NIfTI file.
+        output_path (str): Directory where the output file will be saved.
+
+    Returns:
+        str: Path to the saved NIfTI file containing the largest connected component.
+    """
+    os.makedirs(output_path, exist_ok=True)
+
+    input_nii = nib.load(input_file)
+    input_array = input_nii.get_fdata()
+
+    labeled_segmentation, num_components = label(input_array)
+    component_sizes = np.bincount(labeled_segmentation.ravel())
+    component_sizes[0] = 0  # Exclude background
+
+    largest_component_label = np.argmax(component_sizes)
+    largest_component = (labeled_segmentation == largest_component_label).astype(np.uint8)
+
+    largest_component_nii = nib.Nifti1Image(largest_component, input_nii.affine, input_nii.header)
+
+    base_name = os.path.basename(input_file)
+    file_name, file_ext = os.path.splitext(base_name)
+    if file_ext == ".gz":
+        file_name, file_ext = os.path.splitext(file_name)
+        file_ext += ".gz"
+    output_file = os.path.join(output_path, f"{file_name}_largest_component{file_ext}")
+
+    nib.save(largest_component_nii, output_file)
+    print(f"Largest connected component saved to: {output_file}")
+    return output_file
+
+
+def estimate_radius(segmentation):
+    """
+    Estimate radius along the skeleton of a segmentation.
+
+    Args:
+        segmentation (ndarray): 3D binary segmentation.
+
+    Returns:
+        tuple: A dictionary mapping skeleton points to radii and the 3D skeleton.
+    """
+    skeleton = skeletonize_3d(segmentation > 0)
+    distance_map = distance_transform_edt(segmentation > 0)
+    skeleton_coords = np.array(np.nonzero(skeleton)).T
+
+    radii = {tuple(coord): distance_map[tuple(coord)] for coord in skeleton_coords}
+    return radii, skeleton
+
+
+def remove_cylinder(segmentation, kp1, kp2, radius):
+    """
+    Remove voxels within a cylindrical region between kp1 and kp2.
+
+    Args:
+        segmentation (ndarray): 3D binary segmentation.
+        kp1 (array-like): Starting point of the cylinder (x, y, z).
+        kp2 (array-like): Ending point of the cylinder (x, y, z).
+        radius (float): Radius of the cylinder.
+
+    Returns:
+        ndarray: Modified segmentation with the cylindrical region removed.
+    """
+    kp1 = np.array(kp1)
+    kp2 = np.array(kp2)
+    line_vec = kp2 - kp1
+    line_len = np.linalg.norm(line_vec)
+
+    if line_len == 0:
+        return segmentation  # No change if both points are identical
+
+    line_unitvec = line_vec / line_len
+
+    # Define the bounding box with padding equal to the radius
+    min_coords = np.minimum(kp1, kp2) - radius
+    max_coords = np.maximum(kp1, kp2) + radius
+
+    # Ensure coordinates are within the segmentation bounds
+    min_coords = np.maximum(min_coords, 0).astype(int)
+    max_coords = np.minimum(max_coords, segmentation.shape).astype(int)
+
+    # Create a grid of coordinates within the bounding box
+    X, Y, Z = np.meshgrid(
+        np.arange(min_coords[0], max_coords[0]),
+        np.arange(min_coords[1], max_coords[1]),
+        np.arange(min_coords[2], max_coords[2]),
+        indexing='ij'
+    )
+
+    # Compute vectors from kp1 to each grid point
+    p = np.stack((X - kp1[0], Y - kp1[1], Z - kp1[2]), axis=-1)
+
+    # Project p onto the line vector to find the closest points on the line
+    projection = np.dot(p, line_unitvec)
+    projection = np.clip(projection, 0, line_len)
+    closest = kp1 + projection[..., np.newaxis] * line_unitvec
+
+    # Compute the Euclidean distance from each grid point to the closest point on the line
+    distances = np.linalg.norm(p - projection[..., np.newaxis] * line_unitvec, axis=-1)
+
+    # Create a mask for points within the radius
+    mask = distances <= radius
+
+    # Apply the mask to set segmentation to zero within the cylinder
+    segmentation[min_coords[0]:max_coords[0],
+                min_coords[1]:max_coords[1],
+                min_coords[2]:max_coords[2]][mask] = 0
+
+    return segmentation
+
+
+def introduce_breaks(
+    segmentation_nii, skeleton_points, radii, 
+    num_breaks=1, min_distance=2, max_distance=5, 
+    radius_factor=1.1, min_radius=0, max_skeleton_radius=10
+):
+    """
+    Introduce artificial breaks in the segmentation using skeleton points and radii.
+
+    Args:
+        segmentation_nii (nib.Nifti1Image): NIfTI image containing the segmentation (binary mask).
+        skeleton_points (list of tuple): List of skeleton points (voxel coordinates as tuples).
+        radii (dict): Dictionary mapping skeleton points (tuples) to radii.
+        num_breaks (int): Number of breaks to introduce.
+        min_distance (float): Minimum Euclidean distance between KP1 and KP2.
+        max_distance (float): Maximum Euclidean distance between KP1 and KP2.
+        radius_factor (float): Factor to scale the radius of the cylinder.
+        min_radius (float): Minimum radius for the cylinder.
+        max_skeleton_radius (float): Maximum radius of skeleton points to consider for breaks.
+
+    Returns:
+        nib.Nifti1Image: Modified segmentation with artificial breaks.
+        list: List of break points [{"kp1": [...], "kp2": [...]}, ...] in voxel coordinates.
+    """
+    # Get segmentation data from NIfTI
+    segmentation = segmentation_nii.get_fdata()
+    affine = segmentation_nii.affine
+    header = segmentation_nii.header
+
+    # Copy the segmentation data for modification
+    segmentation_with_breaks = segmentation.copy()
+    break_points = []
+
+    skeleton_points = np.array(skeleton_points)  # Ensure skeleton points are a NumPy array
+    num_skeleton_points = len(skeleton_points)
+    print(f"Total number of skeleton points: {num_skeleton_points}")
+
+    # Filter skeleton points based on max_skeleton_radius
+    filtered_indices = [i for i, pt in enumerate(skeleton_points) if radii.get(tuple(pt), 0) <= max_skeleton_radius]
+    filtered_skeleton = skeleton_points[filtered_indices]
+    filtered_radii = [radii.get(tuple(pt), 0) for pt in filtered_skeleton]
+    num_filtered = len(filtered_skeleton)
+    print(f"Number of skeleton points after filtering (radii <= {max_skeleton_radius} voxels): {num_filtered}")
+
+    if num_filtered < 2:
+        print("Not enough skeleton points after filtering to introduce breaks.")
+        return segmentation_with_breaks, break_points
+
+    # Build KDTree for efficient spatial queries
+    tree = KDTree(filtered_skeleton)
+
+    # Sort filtered skeleton points by ascending radii to prioritize smaller vessels
+    sorted_indices = np.argsort(filtered_radii)
+    sorted_skeleton = filtered_skeleton[sorted_indices]
+    sorted_radii = [filtered_radii[i] for i in sorted_indices]
+
+    # Keep track of used points to avoid overlapping breaks
+    used_points = set()
+
+    for break_idx in range(num_breaks):
+        print(f"\nAttempting to find break {break_idx + 1} of {num_breaks}...")
+        found = False
+
+        for idx, (kp1, radius1) in enumerate(zip(sorted_skeleton, sorted_radii)):
+            kp1_tuple = tuple(kp1)
+            if kp1_tuple in used_points:
+                continue  # Skip already used points
+
+            # Query for neighbors within [min_distance, max_distance]
+            neighbors = tree.query_ball_point(kp1, r=max_distance)
+            # Filter neighbors to satisfy min_distance
+            neighbors = [n for n in neighbors if min_distance <= np.linalg.norm(kp1 - filtered_skeleton[n]) <= max_distance]
+
+            # Remove self from neighbors if present and skip used points
+            neighbors = [n for n in neighbors if n != idx and tuple(filtered_skeleton[n]) not in used_points]
+
+            if neighbors:
+                # Select a random neighbor
+                kp2_idx = np.random.choice(neighbors)
+                kp2 = filtered_skeleton[kp2_idx]
+                kp2_tuple = tuple(kp2)
+
+                # Determine the radius for the break
+                raw_radius = max(radii.get(kp1_tuple, 0), radii.get(kp2_tuple, 0))
+                radius = max(raw_radius * radius_factor, min_radius)
+                print(f"Selected break {break_idx + 1}: KP1={kp1}, KP2={kp2}, Distance={np.linalg.norm(kp1 - kp2):.2f} voxels, Radius={radius:.2f} voxels")
+                print(f"Radii: KP1 Radius={radii.get(kp1_tuple, 0)}, KP2 Radius={radii.get(kp2_tuple, 0)}")
+
+                # Apply cylinder-based masking
+                segmentation_with_breaks = remove_cylinder(segmentation_with_breaks, kp1, kp2, radius)
+
+                # Append the break points as dictionaries
+                break_points.append({
+                    "kp1": kp1.tolist(),
+                    "kp2": kp2.tolist()
+                })
+
+                # Mark points as used
+                used_points.add(kp1_tuple)
+                used_points.add(kp2_tuple)
+
+                found = True
+                break  # Move to the next break after successful addition
+
+        if not found:
+            print(f"Could not find suitable break points within the distance constraints for break {break_idx + 1}.")
+            break  # Exit early if no more suitable pairs are found
+
+    # Check if any breaks were introduced
+    if not break_points:
+        print("No breaks were introduced. Consider adjusting the distance parameters or max_skeleton_radius.")
+    else:
+        print(f"\nTotal breaks introduced: {len(break_points)}")
+
+    # Return the modified segmentation as a NIfTI image
+    segmentation_with_breaks_nii = nib.Nifti1Image(segmentation_with_breaks, affine, header)
+
+    return segmentation_with_breaks_nii, break_points
+
+
+def extract_subvolumes_with_ct(
+    intact_nifti, broken_nifti, ct_nifti, break_points,
+    subvolume_size=(80, 80, 80), num_samples=None, output_dir="output"
+):
+    """
+    Extract subvolumes from NIfTI images (intact, broken, and CT) and update their affine transformations.
+
+    Parameters:
+        intact_nifti, broken_nifti, ct_nifti (nib.Nifti1Image): Input NIfTI images.
+        break_points (list of dict): Breakpoint coordinates.
+        subvolume_size (tuple): Dimensions of subvolumes (x, y, z).
+        num_samples (int): Number of subvolumes to extract.
+        output_dir (str): Directory to save outputs.
+
+    Saves:
+        - Broken, intact, and CT subvolumes as NIfTI files.
+        - Breakpoint metadata as a JSON file.
+    """
+    if num_samples is None:
+        num_samples = len(break_points)
+
+    intact_data, broken_data, ct_data = [nii.get_fdata() for nii in (intact_nifti, broken_nifti, ct_nifti)]
+    affine = intact_nifti.affine
+    half_size = np.array(subvolume_size) // 2
+    os.makedirs(output_dir, exist_ok=True)
+
+    saved_breakpoints = []
+    for idx, break_point in enumerate(break_points[:num_samples]):
+        kp2_coords = np.array(break_point["kp2"])
+        start = np.maximum(kp2_coords - half_size, 0).astype(int)
+        end = np.minimum(kp2_coords + half_size, intact_data.shape).astype(int)
+        slices = tuple(slice(s, e) for s, e in zip(start, end))
+
+        subvolumes = {
+            "broken": broken_data[slices],
+            "intact": intact_data[slices],
+            "ct": ct_data[slices],
+        }
+        updated_affine = affine.copy()
+        updated_affine[:3, 3] = nib.affines.apply_affine(affine, start)
+
+        for name, data in subvolumes.items():
+            nib.save(nib.Nifti1Image(data, updated_affine), os.path.join(output_dir, f"{name}_subvolume_{idx + 1}.nii.gz"))
+
+        saved_breakpoints.append({
+            "kp1": break_point["kp1"],  # Already a list
+            "kp2": break_point["kp2"],  # Already a list
+            "subvolume_paths": {name: f"{name}_subvolume_{idx + 1}.nii.gz" for name in subvolumes}
+        })
+
+    with open(os.path.join(output_dir, "breakpoints.json"), "w") as f:
+        json.dump(saved_breakpoints, f, indent=4)
+
+    print(f"Saved breakpoints information to {os.path.join(output_dir, 'breakpoints.json')}")
+
+
+def analyze_skeleton_distances(skeleton_points):
+    """
+    Analyze and print basic information about pairwise distances between skeleton points.
+
+    Args:
+        skeleton_points (ndarray): Array of skeleton points (N x 3).
+
+    Returns:
+        None
+    """
+    print("\nAnalyzing pairwise distances between skeleton points...")
+    # Sample a subset if too many points
+    max_pairs = 10000
+    num_points = len(skeleton_points)
+    if num_points < 2:
+        print("Not enough skeleton points to analyze distances.")
+        return
+    total_pairs = num_points * (num_points - 1) // 2
+    print(f"Total possible pairs: {total_pairs}")
+    if total_pairs > max_pairs:
+        # Randomly sample pairs
+        rng = np.random.default_rng()
+        indices = rng.choice(num_points, size=(max_pairs, 2), replace=True)
+        distances = np.linalg.norm(skeleton_points[indices[:,0]] - skeleton_points[indices[:,1]], axis=1)
+    else:
+        # Compute all pairwise distances
+        distances = np.linalg.norm(skeleton_points[:, np.newaxis, :] - skeleton_points[np.newaxis, :, :], axis=2)
+        distances = distances[np.triu_indices(num_points, k=1)]
+
+    # Print basic statistics
+    print(f"Distance Statistics:\n - Min: {distances.min():.2f} voxels\n - Max: {distances.max():.2f} voxels\n - Mean: {distances.mean():.2f} voxels\n - Median: {np.median(distances):.2f} voxels")
+
+
+# Example Usage
+if __name__ == "__main__":
+    data_path = "Connectivity_CT/1/"
+    input_file = os.path.join(data_path, "arteries.nii.gz")
+    output_path = os.path.join(data_path, "PROCESSED")
+    largest_component_path = load_and_extract_largest_component(input_file, output_path)
+
+    largest_component_nii = nib.load(largest_component_path)
+    radii, skeleton = estimate_radius(largest_component_nii.get_fdata())
+
+    skeleton_points = np.array(list(radii.keys()))
+    print(f"Number of skeleton points: {len(skeleton_points)}")
+
+    # Optional: Analyze the distribution of distances between skeleton points
+    analyze_skeleton_distances(skeleton_points)
+
+    # Set maximum skeleton radius to target small vessels (adjust as needed)
+    max_skeleton_radius = 5  # voxels (example value)
+
+    # Introduce breaks with adjusted parameters
+    broken_segmentation, break_points = introduce_breaks(
+        largest_component_nii, 
+        skeleton_points=skeleton_points, 
+        radii=radii, 
+        num_breaks=3, 
+        min_distance=5, 
+        max_distance=15, 
+        radius_factor=1.1, 
+        min_radius=1, 
+        max_skeleton_radius=max_skeleton_radius
+    )
+
+    # Save the broken segmentation as its own NIfTI file in the PROCESSED folder
+    broken_file = os.path.join(output_path, "arteries_broken.nii.gz")
+    nib.save(broken_segmentation, broken_file)
+    print(f"Broken segmentation saved to: {broken_file}")
+
+    # Check if breaks were introduced
+    if not break_points:
+        print("No breaks were introduced. Try adjusting the distance parameters or max_skeleton_radius.")
+    else:
+        print(f"Introduced {len(break_points)} breaks.")
+
+    # Proceed only if breaks were introduced
+    if break_points:
+        ct_file = os.path.join(data_path, "img.nii.gz")
+        ct_nii = nib.load(ct_file)
+
+        output_dir = os.path.join(data_path, "SYNTHETIC_BREAKS")
+        extract_subvolumes_with_ct(largest_component_nii, broken_segmentation, ct_nii, break_points, output_dir=output_dir)
